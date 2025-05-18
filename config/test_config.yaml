@@ -1,0 +1,88 @@
+model:
+  name: "Qwen/Qwen1.5-0.6B"
+  tokenizer: "Qwen/Qwen1.5-0.6B"
+  max_length: 2048
+  use_flash_attention: true
+  precision: "bf16"
+
+trainer:
+  project_name: "hato"
+  experiment_name: "hato_qwen_0.6b_test"
+  logger: "none"
+  total_epochs: 1
+  critic_warmup: 10
+  test_freq: 5
+  save_freq: 10
+  val_before_train: true
+  val_only: false
+  balance_batch: true
+  output_dir: "./outputs/test"
+  checkpoint_path: null
+
+resource:
+  n_actor_worker: 1
+  n_critic_worker: 1
+  n_rm_worker: 1
+  n_ref_worker: 1
+  actor_worker_use_gpu: true
+  critic_worker_use_gpu: true
+  rm_worker_use_gpu: true
+  ref_worker_use_gpu: true
+  actor_worker_gpu_memory: 8000
+  critic_worker_gpu_memory: 8000
+  rm_worker_gpu_memory: 8000
+  ref_worker_gpu_memory: 8000
+
+algorithm:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  normalize_advantage: true
+  max_grad_norm: 0.5
+  filter_groups:
+    enable: true
+  kl_penalty:
+    enable: true
+    beta: 0.1
+    target_kl: 0.01
+
+hato:
+  tree:
+    max_depth: 3
+    branching_factor: 3
+    search_algorithm: "beam"
+    max_nodes_per_level: 3
+  
+  reward_weights:
+    alpha: 0.4
+    beta: 0.5
+    gamma: 0.1
+  
+  exploration:
+    initial_temperature: 0.7
+    temperature_decay: 2.0
+  
+  uncertainty:
+    type: "ensemble"
+    n_models: 3
+    dropout_rate: 0.1
+    n_forward_passes: 5
+    n_bootstrap: 3
+    model_config:
+      hidden_size: 64
+      n_layers: 1
+  
+  meta_learning:
+    enable: true
+    type: "reptile"
+    inner_lr: 0.01
+    outer_lr: 0.001
+    meta_lr: 0.1
+    n_inner_steps: 3
+  
+  memory:
+    sparse_materialization: true
+    pruning_threshold: 0.2
+    max_nodes: 100
+  
+  verification_threshold: 0.7
