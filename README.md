@@ -88,7 +88,10 @@ cd hato
 2. Install dependencies:
 
 ```bash
+conda create -n hato
+conda activate hato
 pip install -r requirements.txt
+git clone https://github.com/volcengine/verl.git && cd verl && pip install -e . --no-deps
 ```
 
 ## Usage

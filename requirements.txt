@@ -1,0 +1,24 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.20.0
+matplotlib>=3.5.0
+pandas>=1.3.0
+tqdm>=4.62.0
+
+# Dataset and evaluation
+datasets>=2.10.0
+scikit-learn>=1.0.0
+
+# Configuration and logging
+pyyaml>=6.0
+omegaconf>=2.2.0
+wandb>=0.15.0
+
+# VERL framework - install separately with: pip install git+https://github.com/volcengine/verl.git --no-deps
+# Note: If you get encoding errors, try: pip install git+https://github.com/volcengine/verl.git --no-deps --config-settings="--global-option=--no-cache-dir"
+
+# Utilities
+huggingface-hub>=0.14.0
+fsspec>=2023.1.0
+dill>=0.3.0
