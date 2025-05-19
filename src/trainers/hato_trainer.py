@@ -1,7 +1,19 @@
 import uuid
+import logging
 from collections import defaultdict
 from copy import deepcopy
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import (
+    Dict,
+    List,
+    Any,
+    Optional,
+    Tuple,
+    Union,
+    Type,
+    cast,
+    Protocol,
+    TYPE_CHECKING,
+)
 
 import numpy as np
 import torch
@@ -17,15 +29,65 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     compute_advantage,
+    Role,
+    WorkerType,
+    RayWorkerGroup,
 )
+
+if TYPE_CHECKING:
+    from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+else:
+    ResourcePoolManager = Any  # type: ignore
 
 from ..tree import ReasoningTree, ThoughtNode
 from ..search import (
     adaptive_tree_search,
     UncertaintyEstimator,
     EnsembleUncertaintyEstimator,
+    DropoutUncertaintyEstimator,
+    BootstrapUncertaintyEstimator,
 )
 from ..rewards import HierarchicalRewardModel
+
+
+# Define meta learner protocol
+class MetaLearner(Protocol):
+    """Protocol for meta learners"""
+
+    def update(self, *args, **kwargs) -> None: ...
+    def adapt(self, *args, **kwargs) -> None: ...
+
+
+class MAMLMetaLearner:
+    """Model-Agnostic Meta-Learning implementation"""
+
+    def __init__(self, **kwargs):
+        self.inner_lr = kwargs.get("inner_lr", 0.01)
+        self.outer_lr = kwargs.get("outer_lr", 0.001)
+        self.n_inner_steps = kwargs.get("n_inner_steps", 5)
+
+    def update(self, *args, **kwargs) -> None:
+        pass
+
+    def adapt(self, *args, **kwargs) -> None:
+        pass
+
+
+class ReptileMetaLearner:
+    """Reptile meta-learning implementation"""
+
+    def __init__(self, **kwargs):
+        self.meta_lr = kwargs.get("meta_lr", 0.1)
+        self.n_inner_steps = kwargs.get("n_inner_steps", 5)
+
+    def update(self, *args, **kwargs) -> None:
+        pass
+
+    def adapt(self, *args, **kwargs) -> None:
+        pass
+
+
+logger = logging.getLogger(__name__)
 
 
 class HATOTrainer(RayPPOTrainer):
@@ -44,14 +106,34 @@ class HATOTrainer(RayPPOTrainer):
     - Theorem 2: Bounded variance of policy gradient estimator
     """
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        role_worker_mapping: dict[Role, WorkerType],
+        resource_pool_manager: ResourcePoolManager,
+        **kwargs,
+    ):
         """
         Initialize HATO trainer
 
         Args:
             config: Configuration object with HATO-specific parameters
+            tokenizer: Tokenizer for the language model
+            role_worker_mapping: Mapping of roles to worker types
+            resource_pool_manager: Resource pool manager for distributed training
+            **kwargs: Additional arguments passed to parent class
         """
-        super().__init__(config)
+        super().__init__(
+            config=config,
+            tokenizer=tokenizer,
+            role_worker_mapping=role_worker_mapping,
+            resource_pool_manager=resource_pool_manager,
+            **kwargs,
+        )
+
+        # Validate HATO-specific config
+        self._validate_hato_config()
 
         # Initialize hierarchical reward model
         self.hierarchical_reward_model = HierarchicalRewardModel(
@@ -74,6 +156,38 @@ class HATOTrainer(RayPPOTrainer):
         self.initial_temperature = self.config.hato.exploration.initial_temperature
         self.temperature_decay = self.config.hato.exploration.temperature_decay
         self.current_temperature = self.initial_temperature
+
+        # Set up model and device
+        self._setup_model_and_device()
+
+    def _setup_model_and_device(self):
+        """Set up model and device after parent initialization"""
+        # Access workers through actor_rollout_wg
+        self.actor_model = self.actor_rollout_wg.workers[0].model
+        self.device = next(self.actor_model.parameters()).device
+
+    def _validate_hato_config(self):
+        """Validate HATO-specific configuration"""
+        assert hasattr(self.config, "hato"), "Missing hato config"
+        assert hasattr(self.config.hato, "reward_weights"), "Missing reward weights"
+        assert all(
+            0 <= w <= 1
+            for w in [
+                self.config.hato.reward_weights.alpha,
+                self.config.hato.reward_weights.beta,
+                self.config.hato.reward_weights.gamma,
+            ]
+        ), "Reward weights must be between 0 and 1"
+        assert (
+            sum(
+                [
+                    self.config.hato.reward_weights.alpha,
+                    self.config.hato.reward_weights.beta,
+                    self.config.hato.reward_weights.gamma,
+                ]
+            )
+            == 1.0
+        ), "Reward weights must sum to 1.0"
 
     def _create_uncertainty_estimator(self):
         """
@@ -255,7 +369,9 @@ class HATOTrainer(RayPPOTrainer):
 
         return is_correct
 
-    def _nodes_to_batch(self, all_nodes_by_level):
+    def _nodes_to_batch(
+        self, all_nodes_by_level: Dict[int, List[ThoughtNode]]
+    ) -> DataProto:
         """
         Convert tree nodes to training batch
 
@@ -265,77 +381,78 @@ class HATOTrainer(RayPPOTrainer):
         Returns:
             batch: DataProto containing node data for training
         """
-        # Group nodes by parent for GRPO
-        parent_groups = {}
-        for level, nodes in all_nodes_by_level.items():
-            for node in nodes:
-                parent_id = id(node.parent)
-                if parent_id not in parent_groups:
-                    parent_groups[parent_id] = []
-                parent_groups[parent_id].append(node)
+        try:
+            # Group nodes by parent for GRPO
+            parent_groups = {}
+            for level, nodes in all_nodes_by_level.items():
+                for node in nodes:
+                    parent_id = id(node.parent)
+                    if parent_id not in parent_groups:
+                        parent_groups[parent_id] = []
+                    parent_groups[parent_id].append(node)
 
-        # Filter groups with no reward variance if enabled
-        if self.config.algorithm.filter_groups.enable:
-            filtered_groups = []
-            for parent_id, group in parent_groups.items():
-                if len(group) < 2:  # Need at least 2 nodes for variance
-                    continue
+            # Filter groups with no reward variance if enabled
+            if self.config.algorithm.filter_groups.enable:
+                filtered_groups = []
+                for parent_id, group in parent_groups.items():
+                    if len(group) < 2:  # Need at least 2 nodes for variance
+                        continue
 
-                rewards = [node.total_reward for node in group]
-                if np.std(rewards) > 0:
-                    filtered_groups.append(group)
+                    rewards = [node.total_reward for node in group]
+                    if np.std(rewards) > 0:
+                        filtered_groups.append(group)
 
-            # Use filtered groups
-            parent_groups = {i: group for i, group in enumerate(filtered_groups)}
+                # Use filtered groups
+                parent_groups = {i: group for i, group in enumerate(filtered_groups)}
 
-        # Prepare batch data
-        all_contents = []
-        all_rewards = []
-        all_parent_contents = []
-        all_group_ids = []
+            # Prepare batch data
+            all_contents = []
+            all_rewards = []
+            all_parent_contents = []
+            all_group_ids = []
 
-        for group_id, group in parent_groups.items():
-            for node in group:
-                all_contents.append(node.content)
-                all_rewards.append(node.total_reward)
-                all_parent_contents.append(node.parent.content)
-                all_group_ids.append(group_id)
+            for group_id, group in parent_groups.items():
+                for node in group:
+                    all_contents.append(node.content)
+                    all_rewards.append(node.total_reward)
+                    all_parent_contents.append(node.parent.content)
+                    all_group_ids.append(group_id)
 
-        # Create batch dictionary
-        batch_dict = {
-            "contents": all_contents,
-            "rewards": all_rewards,
-            "parent_contents": all_parent_contents,
-            "group_ids": all_group_ids,
-        }
+            # Create batch dictionary
+            batch_dict = {
+                "input_ids": self.tokenizer(
+                    all_contents,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.config.model.max_length,
+                )["input_ids"],
+                "attention_mask": self.tokenizer(
+                    all_contents,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=self.config.model.max_length,
+                )["attention_mask"],
+                "token_level_rewards": torch.tensor(all_rewards)
+                .unsqueeze(-1)
+                .expand(-1, self.config.model.max_length),
+            }
 
-        # Tokenize contents
-        tokenized_inputs = self.tokenizer(
-            all_contents,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.config.model.max_length,
-        )
+            # Create DataProto with dictionary
+            batch = DataProto.from_single_dict(batch_dict)
+            batch.non_tensor_batch = {
+                "raw_prompts": all_contents,
+                "parent_prompts": all_parent_contents,
+                "group_ids": np.array(all_group_ids),
+                "rewards": np.array(all_rewards),
+            }
 
-        # Create DataProto
-        batch = DataProto()
-        batch.batch = {
-            "input_ids": tokenized_inputs["input_ids"],
-            "attention_mask": tokenized_inputs["attention_mask"],
-            "token_level_rewards": torch.tensor(all_rewards)
-            .unsqueeze(-1)
-            .expand(-1, tokenized_inputs["input_ids"].shape[1]),
-        }
+            return batch
 
-        batch.non_tensor_batch = {
-            "raw_prompts": all_contents,
-            "parent_prompts": all_parent_contents,
-            "group_ids": np.array(all_group_ids),
-            "rewards": np.array(all_rewards),
-        }
-
-        return batch
+        except Exception as e:
+            logger.error(f"Error converting nodes to batch: {e}")
+            raise
 
     def _get_current_temperature(self):
         """
@@ -351,7 +468,7 @@ class HATOTrainer(RayPPOTrainer):
         self.current_temperature = temperature
         return temperature
 
-    def train_step(self, batch_dict):
+    def train_step(self, batch_dict: Dict[str, Any]) -> Dict[str, float]:
         """
         Perform a single training step
 
@@ -361,52 +478,60 @@ class HATOTrainer(RayPPOTrainer):
         Returns:
             metrics: Dictionary of training metrics
         """
-        # Generate reasoning trees
-        trees, tree_batch = self.generate_reasoning_trees(batch_dict)
+        try:
+            logger.info(f"Starting training step {self.global_steps}")
 
-        # Perform standard PPO training step with tree batch
-        metrics = super().train_step(tree_batch)
+            # Generate reasoning trees
+            trees, tree_batch = self.generate_reasoning_trees(batch_dict)
 
-        # Add tree metrics
-        for k, v in self.tree_metrics.items():
-            if v:
-                metrics[f"tree/{k}"] = np.mean(v)
+            # Use parent class's fit method
+            metrics = super().fit()
 
-        # Clear tree metrics for next step
-        self.tree_metrics = defaultdict(list)
+            # Add tree metrics
+            for k, v in self.tree_metrics.items():
+                if v:
+                    metrics[f"tree/{k}"] = np.mean(v)
 
-        return metrics
+            # Clear tree metrics for next step
+            self.tree_metrics = defaultdict(list)
 
-    def compute_advantages(self, batch):
+            logger.info(f"Training step metrics: {metrics}")
+            return metrics
+
+        except Exception as e:
+            logger.error(f"Error in training step: {e}")
+            raise
+
+    def compute_advantages(self, batch: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute advantages for HATO policy gradient
-
-        This implements the policy optimization with hierarchical rewards:
-        L_HATO(θ) = E_{n ∈ T} [min(r_t(θ)A_t, clip(r_t(θ), 1-ε, 1+ε)A_t)]
 
         Args:
             batch: DataProto containing batch data
 
         Returns:
-            advantages: Computed advantages
-            returns: Computed returns
+            advantages: Computed advantages as tensor
+            returns: Computed returns as tensor
         """
-        # Use standard advantage computation from VERL
-        advantages, returns = compute_advantage(
-            batch,
-            self.config.algorithm.gamma,
-            self.config.algorithm.gae_lambda,
-            self.config.algorithm.normalize_advantage,
-        )
+        try:
+            # Use standard advantage computation from VERL
+            advantages, returns = compute_advantage(
+                batch,
+                self.config.algorithm.gamma,
+                self.config.algorithm.gae_lambda,
+                self.config.algorithm.normalize_advantage,
+            )
 
-        # Group advantages by group_id for GRPO
-        group_ids = batch.non_tensor_batch.get("group_ids", None)
-        if group_ids is not None:
-            # Normalize advantages within each group
-            unique_groups = np.unique(group_ids)
+            # Convert to tensor for operations
+            advantages_tensor = torch.tensor(batch.batch["advantages"])
+            returns_tensor = torch.tensor(batch.batch["returns"])
+            group_ids = torch.tensor(batch.non_tensor_batch["group_ids"])
+
+            # Group advantages by group_id for GRPO
+            unique_groups = torch.unique(group_ids)
             for group_id in unique_groups:
                 group_mask = group_ids == group_id
-                group_advantages = advantages[group_mask]
+                group_advantages = advantages_tensor[group_mask]
 
                 # Skip groups with only one element
                 if len(group_advantages) <= 1:
@@ -416,10 +541,17 @@ class HATOTrainer(RayPPOTrainer):
                 group_mean = group_advantages.mean()
                 group_std = group_advantages.std()
                 if group_std > 0:
-                    normalized_advantages = (group_advantages - group_mean) / group_std
-                    advantages[group_mask] = normalized_advantages
+                    advantages_tensor[group_mask] = (
+                        group_advantages - group_mean
+                    ) / group_std
 
-        return advantages, returns
+            # Update batch
+            batch.batch["advantages"] = advantages_tensor.numpy()
+            return advantages_tensor, returns_tensor
+
+        except Exception as e:
+            logger.error(f"Error computing advantages: {e}")
+            raise
 
     def evaluate(self, batch_dict):
         """
