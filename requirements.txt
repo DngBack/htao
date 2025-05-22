@@ -28,3 +28,4 @@ dill
 fastapi 
 uvicorn
 openai
+flash-attn
