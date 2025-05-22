@@ -90,8 +90,12 @@ cd hato
 ```bash
 conda create -n hato
 conda activate hato
-pip install -r requirements.txt
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
 git clone https://github.com/volcengine/verl.git && cd verl && pip install -e . --no-deps
+
+cd .. && pip install -r requirements.txt
 ```
 
 ## Usage
@@ -166,3 +170,55 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - VERL framework for the base DAPO trainer
 - Tree of Thought (ToT) paper for the reasoning framework
 - GSM8K dataset for evaluation
+
+## Data Preparation
+
+The framework supports several math reasoning datasets:
+
+- GSM8K: Grade School Math 8K dataset
+- MATH: Mathematical Problem Solving dataset
+- AQUA: Algebraic Question Answering dataset
+
+To download and prepare the datasets:
+
+1. Install data preparation dependencies:
+
+```bash
+pip install -r requirements-data.txt
+```
+
+2. Run the data preparation script:
+
+```bash
+# Download all datasets
+python scripts/prepare_data.py
+
+# Download specific dataset
+python scripts/prepare_data.py --dataset gsm8k
+
+# Force redownload
+python scripts/prepare_data.py --force
+
+# Specify data directory
+python scripts/prepare_data.py --data_dir /path/to/data
+```
+
+The script will:
+
+1. Download raw datasets
+2. Process them into a standard format
+3. Save processed files as JSONL
+
+Processed data format:
+
+```json
+{
+    "problem": "Problem statement",
+    "solution": "Step-by-step solution",
+    "answer": "Final answer",
+    // Additional fields for specific datasets
+    "level": "Difficulty level (MATH)",
+    "type": "Problem type (MATH)",
+    "options": ["Option A", "Option B", ...] (AQUA)
+}
+```
